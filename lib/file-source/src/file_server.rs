@@ -293,79 +293,9 @@ where
             }
 
             // Collect lines by polling files.
-            let mut global_bytes_read: usize = 0;
-            let mut maxed_out_reading_single_file = false;
-            for (&file_id, watcher) in &mut fp_map {
-                if !watcher.should_read() {
-                    continue;
-                }
-
-                let start = time::Instant::now();
-                let mut bytes_read: usize = 0;
-                while let Ok(RawLineResult {
-                    raw_line: Some(line),
-                    discarded_for_size_and_truncated,
-                }) = watcher.read_line().await
-                {
-                    for buf in &discarded_for_size_and_truncated {
-                        self.emitter.emit_file_line_too_long(
-                            &buf.clone(),
-                            self.max_line_bytes,
-                            buf.len(),
-                        );
-                    }
-
-                    let sz = line.bytes.len();
-                    trace!(
-                        message = "Read bytes.",
-                        path = ?watcher.path,
-                        bytes = ?sz
-                    );
-                    stats.record_bytes(sz);
-
-                    bytes_read += sz;
-
-                    lines.push(Line {
-                        text: line.bytes,
-                        filename: watcher.path.to_str().expect("not a valid path").to_owned(),
-                        file_id,
-                        start_offset: line.offset,
-                        end_offset: watcher.get_file_position(),
-                    });
-
-                    if bytes_read > self.max_read_bytes {
-                        maxed_out_reading_single_file = true;
-                        break;
-                    }
-                }
-                stats.record("reading", start.elapsed());
-
-                if bytes_read > 0 {
-                    global_bytes_read = global_bytes_read.saturating_add(bytes_read);
-                } else {
-                    // Should the file be removed
-                    if let Some(grace_period) = self.remove_after
-                        && watcher.last_read_success().elapsed() >= grace_period
-                    {
-                        // Try to remove
-                        match remove_file(&watcher.path).await {
-                            Ok(()) => {
-                                self.emitter.emit_file_deleted(&watcher.path);
-                                watcher.set_dead();
-                            }
-                            Err(error) => {
-                                // We will try again after some time.
-                                self.emitter.emit_file_delete_error(&watcher.path, error);
-                            }
-                        }
-                    }
-                }
-
-                // Do not move on to newer files if we are behind on an older file
-                if self.oldest_first && maxed_out_reading_single_file {
-                    break;
-                }
-            }
+            let global_bytes_read = self
+                .read_watched_files(&mut fp_map, &mut lines, &mut stats, false)
+                .await;
 
             for (_, watcher) in &mut fp_map {
                 if !watcher.file_findable() && watcher.last_seen().elapsed() > self.rotate_wait {
@@ -433,6 +363,19 @@ where
             futures::pin_mut!(sleep);
             match select(shutdown_data, sleep).await {
                 Either::Left((_shutdown_token, _)) => {
+                    // Lines may have been appended to watched files while we
+                    // were sleeping in the backoff above. Read them once more
+                    // before exiting, otherwise they are lost when the files
+                    // and checkpoints go away together (e.g. node termination).
+                    self.read_watched_files(&mut fp_map, &mut lines, &mut stats, true)
+                        .await;
+                    if !lines.is_empty() {
+                        let to_send = std::mem::take(&mut lines);
+                        if let Err(error) = chans.send(to_send).await {
+                            error!(message = "Output channel closed.", %error);
+                            return Err(error);
+                        }
+                    }
                     chans
                         .close()
                         .await
@@ -451,6 +394,94 @@ where
             }
             stats.record("sleeping", start.elapsed());
         }
+    }
+
+    /// Do one bounded read pass over the watched files, appending the lines
+    /// read to `lines`. Returns the number of bytes read.
+    ///
+    /// With `ignore_read_backoff`, files are read even if their per-file EOF
+    /// backoff says they should be skipped this time around.
+    async fn read_watched_files(
+        &self,
+        fp_map: &mut IndexMap<FileFingerprint, FileWatcher>,
+        lines: &mut Vec<Line>,
+        stats: &mut TimingStats,
+        ignore_read_backoff: bool,
+    ) -> usize {
+        let mut global_bytes_read: usize = 0;
+        let mut maxed_out_reading_single_file = false;
+        for (&file_id, watcher) in fp_map.iter_mut() {
+            if !ignore_read_backoff && !watcher.should_read() {
+                continue;
+            }
+
+            let start = time::Instant::now();
+            let mut bytes_read: usize = 0;
+            while let Ok(RawLineResult {
+                raw_line: Some(line),
+                discarded_for_size_and_truncated,
+            }) = watcher.read_line().await
+            {
+                for buf in &discarded_for_size_and_truncated {
+                    self.emitter.emit_file_line_too_long(
+                        &buf.clone(),
+                        self.max_line_bytes,
+                        buf.len(),
+                    );
+                }
+
+                let sz = line.bytes.len();
+                trace!(
+                    message = "Read bytes.",
+                    path = ?watcher.path,
+                    bytes = ?sz
+                );
+                stats.record_bytes(sz);
+
+                bytes_read += sz;
+
+                lines.push(Line {
+                    text: line.bytes,
+                    filename: watcher.path.to_str().expect("not a valid path").to_owned(),
+                    file_id,
+                    start_offset: line.offset,
+                    end_offset: watcher.get_file_position(),
+                });
+
+                if bytes_read > self.max_read_bytes {
+                    maxed_out_reading_single_file = true;
+                    break;
+                }
+            }
+            stats.record("reading", start.elapsed());
+
+            if bytes_read > 0 {
+                global_bytes_read = global_bytes_read.saturating_add(bytes_read);
+            } else {
+                // Should the file be removed
+                if let Some(grace_period) = self.remove_after
+                    && watcher.last_read_success().elapsed() >= grace_period
+                {
+                    // Try to remove
+                    match remove_file(&watcher.path).await {
+                        Ok(()) => {
+                            self.emitter.emit_file_deleted(&watcher.path);
+                            watcher.set_dead();
+                        }
+                        Err(error) => {
+                            // We will try again after some time.
+                            self.emitter.emit_file_delete_error(&watcher.path, error);
+                        }
+                    }
+                }
+            }
+
+            // Do not move on to newer files if we are behind on an older file
+            if self.oldest_first && maxed_out_reading_single_file {
+                break;
+            }
+        }
+        global_bytes_read
     }
 
     async fn watch_new_file(
@@ -629,4 +660,101 @@ pub struct Line {
     pub file_id: FileFingerprint,
     pub start_offset: u64,
     pub end_offset: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io::Write, path::Path};
+
+    use bytes::BytesMut;
+    use file_source_common::FingerprintStrategy;
+    use futures::{StreamExt, channel::mpsc};
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct NoopEmitter;
+
+    impl FileSourceInternalEvents for NoopEmitter {
+        fn emit_file_added(&self, _: &Path) {}
+        fn emit_file_resumed(&self, _: &Path, _: u64) {}
+        fn emit_file_watch_error(&self, _: &Path, _: std::io::Error) {}
+        fn emit_file_unwatched(&self, _: &Path, _: bool, _: Option<u64>) {}
+        fn emit_file_deleted(&self, _: &Path) {}
+        fn emit_file_delete_error(&self, _: &Path, _: std::io::Error) {}
+        fn emit_file_fingerprint_read_error(&self, _: &Path, _: std::io::Error) {}
+        fn emit_file_checkpointed(&self, _: usize, _: Duration) {}
+        fn emit_file_checksum_failed(&self, _: &Path) {}
+        fn emit_file_checkpoint_write_error(&self, _: std::io::Error) {}
+        fn emit_files_open(&self, _: usize) {}
+        fn emit_path_globbing_failed(&self, _: &Path, _: &std::io::Error) {}
+        fn emit_file_line_too_long(&self, _: &BytesMut, _: usize, _: usize) {}
+    }
+
+    struct StaticPaths(Vec<PathBuf>);
+
+    impl PathsProvider for StaticPaths {
+        type IntoIter = Vec<PathBuf>;
+
+        fn paths(&self) -> Self::IntoIter {
+            self.0.clone()
+        }
+    }
+
+    // Lines appended while the server sleeps in its idle backoff must still
+    // be read when shutdown arrives during that sleep.
+    #[tokio::test]
+    async fn reads_lines_written_just_before_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "first").unwrap();
+        file.flush().unwrap();
+
+        let server = FileServer {
+            paths_provider: StaticPaths(vec![path.clone()]),
+            max_read_bytes: 2048,
+            ignore_checkpoints: true,
+            read_from: ReadFrom::Beginning,
+            ignore_before: None,
+            max_line_bytes: 1024,
+            line_delimiter: Bytes::from("\n"),
+            data_dir: dir.path().to_path_buf(),
+            glob_minimum_cooldown: Duration::from_mins(1),
+            fingerprinter: Fingerprinter::new(FingerprintStrategy::DevInode, 1024, false),
+            oldest_first: false,
+            remove_after: None,
+            emitter: NoopEmitter,
+            rotate_wait: Duration::from_mins(1),
+        };
+        let checkpointer = Checkpointer::new(dir.path());
+
+        let (tx, mut rx) = mpsc::channel::<Vec<Line>>(16);
+        let (shutdown_data_tx, shutdown_data) = oneshot::channel::<()>();
+        let (shutdown_checkpointer_tx, shutdown_checkpointer) = oneshot::channel::<()>();
+        let server =
+            tokio::spawn(server.run(tx, shutdown_data, shutdown_checkpointer, checkpointer));
+
+        let mut received = Vec::new();
+        while !received.iter().any(|l: &Line| l.text == "first") {
+            received.extend(rx.next().await.unwrap());
+        }
+
+        // Let the idle backoff grow so the server is sleeping when we append
+        // the final line and signal shutdown right after.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        writeln!(file, "last").unwrap();
+        file.flush().unwrap();
+        shutdown_checkpointer_tx.send(()).unwrap();
+        shutdown_data_tx.send(()).unwrap();
+
+        while let Some(batch) = rx.next().await {
+            received.extend(batch);
+        }
+        server.await.unwrap().unwrap();
+
+        let texts: Vec<_> = received.iter().map(|l| l.text.clone()).collect();
+        assert_eq!(texts, vec![Bytes::from("first"), Bytes::from("last")]);
+    }
 }
